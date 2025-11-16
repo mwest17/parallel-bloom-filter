@@ -90,7 +90,7 @@
     *out: pointer to output data (write-only), outlen bytes must be allocated
     outlen: length of the output in bytes, must be 8 or 16
 */
-int siphash(const void *in, const size_t inlen, const void *k, uint8_t *out,
+__host__ __device__ inline int siphash(const void *in, const size_t inlen, const void *k, uint8_t *out,
             const size_t outlen) {
 
     const unsigned char *ni = (const unsigned char *)in;
@@ -195,8 +195,17 @@ struct bloom_filter{
     int misses;                     // number of misses (default: 0)
 };
 
+typedef struct bloom_filter_gpu{
+    uint8_t num_hashes;             // number of hashes
+    double error;                   // desired probability for false positives
+    uint128_t num_bits;             // number of bits in array
+    uint128_t num_elements;         // number of strings in the array
+    int misses;                     // number of misses (default: 0)
+} filter_gpu;
+
 double ERROR;                                   // false positivity rate of the filter (determined by user)
 uint64_t NUMBER_OF_ELEMENTS, STRINGS_ADDED;     // number of strings total and number of strings added to the filter
+int blockSize;
 
 struct bloom_filter bf_h;               // bloom filters for host (cpu)
 char *strings_h;            // 1D-char array for host (cpu)
@@ -207,12 +216,12 @@ float elapsed_time;                 // used to print elapsed time
 struct timeval start, stop;            
 
 /* Starts the CPU timer */
-void start_timer() {
+void start_timer_CPU() {
     gettimeofday(&start, NULL);
 }
 
 /* Stops the CPU timer */
-void stop_timer() {
+void stop_timer_CPU() {
     gettimeofday(&stop, NULL);
     elapsed_time = (stop.tv_sec - start.tv_sec) * 1000.0;
     elapsed_time += (stop.tv_usec - start.tv_usec) / 1000.0;
@@ -314,13 +323,13 @@ char get_random_character(){
     **positions: pointer to int array (pass by reference so that a copy isn't required)
         -- stores all string offsets into a single 1d-array
 */
-void generate_flattened_string(int count, int max_string_length, char **flattened, int **positions){
+int generate_flattened_string(int count, int max_string_length, char **flattened, int **positions){
     *positions = (int *)malloc(count * sizeof(int));
     *flattened = (char *)malloc((max_string_length + 1) * count * sizeof(char)); // Overestimate
 
     int current_position = 0;
     for (int i = 0; i < count; i++){
-        int length = rand() % max_string_length + 1;
+        int length = rand() % (max_string_length - 4) + 4 + 1; // Strings of 5-20 characters
         (*positions)[i] = current_position;
 
         for (int j = 0; j < length; j++){
@@ -332,20 +341,105 @@ void generate_flattened_string(int count, int max_string_length, char **flattene
 
     // Realloc now that the size is known.
     *flattened = (char *)realloc(*flattened, current_position * sizeof(char));
+    return current_position * sizeof(char);
 }
+
+//##############################################################################
+// GPU Code
+//##############################################################################
+
+
+
+__global__ void insertionKernel(filter_gpu* filter, 
+                                uint8_t* byte_array, 
+                                char* strings,
+                                int* positions,
+                                int count) 
+{
+    // Threads overall index
+    unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    
+    if (index < count) 
+    {
+        char* str = strings + positions[index];
+        uint64_t hash;
+        uint8_t out[8], key[16] = {1}; // Need to make sure it is NOT in global memory
+
+        // find the string length -- cannot use strlen() because that is __host__ only.
+        uint8_t len = 0;
+        while (str[len] != '\0') { len++; }
+
+        // generate and add as many hashes as required (determined by function init_filter)
+        for (uint8_t i = 0; i < filter->num_hashes; i++) {
+            siphash(str, len, key, out, 8);             // create a new hash from the given string and key
+            
+            memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
+            byte_array[hash % filter->num_bits] = 1;     // set the index byte to 1
+
+            // regenerate a new key based on the previous hash
+            for (size_t j = 0; j < 16; j++) {
+                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
+            }
+        }
+    }
+}
+
+// __device__ inline int sipHashGPU()
+// {
+
+// }
+
+__global__ void missesKernel()
+{
+
+}
+
+
+
+
+
+cudaEvent_t gpu_start, gpu_stop;
+
+inline void start_timer() 
+{
+    // Start timing
+	cudaEventCreate(&gpu_start);
+	cudaEventCreate(&gpu_stop);
+	cudaEventRecord(gpu_start, 0);
+}
+
+
+inline double stop_timer() 
+{
+    // Record end time
+	cudaEventRecord(gpu_stop, 0);
+	cudaEventSynchronize(gpu_stop);
+
+	// Calculate total time spent computing
+	float elapsedTime;
+	cudaEventElapsedTime(&elapsedTime, gpu_start, gpu_stop);
+	cudaEventDestroy(gpu_start);
+	cudaEventDestroy(gpu_stop);\
+
+    return elapsedTime;
+}
+
+
+//##############################################################################
 
 int main(int argc, char **argv) {
 
     /* _____ COMMAND LINE ARGUMENTS _________________________________________________________________________ */
 
-    if (argc != 3) {
-        printf("Invalid. Requires 2 arguments.\n");
+    if (argc != 4) {
+        printf("Invalid. Requires 3 arguments.\n");
         printf("{ # of elements } { desired %% error }\n\n");
         return -1;
     }
 
     NUMBER_OF_ELEMENTS = atoi(argv[1]);
     ERROR = atof(argv[2]);
+    blockSize = atoi(argv[3]);
     if ((ERROR >= 1) || (ERROR <= 0)) {
         printf("Invalid. Error must be within 0 and 1. Currently => %.3lf\n\n", ERROR);
         return -1;
@@ -356,7 +450,7 @@ int main(int argc, char **argv) {
     /* _____ GENERATE STRINGS _______________________________________________________________________________ */
 
     srand(1);   // set seed for randomly generated strings
-    generate_flattened_string(NUMBER_OF_ELEMENTS, MAX_STRING_LENGTH, &strings_h, &positions_h);
+    int lenStrings = generate_flattened_string(NUMBER_OF_ELEMENTS, MAX_STRING_LENGTH, &strings_h, &positions_h);
 
     /* _____ INITIALIZE CPU FILTER __________________________________________________________________________ */
 
@@ -368,7 +462,7 @@ int main(int argc, char **argv) {
 
     /* _____ TEST CPU CODE  _________________________________________________________________________________ */
 
-    start_timer();
+    start_timer_CPU();
     for (int i = 0; i < STRINGS_ADDED; i++) {
         add_to_filter(&bf_h, byte_array_h, strings_h + positions_h[i]);
     }
@@ -376,15 +470,83 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NUMBER_OF_ELEMENTS; i++) {
         if (check_filter(&bf_h, byte_array_h, strings_h + positions_h[i]) == 0) { bf_h.misses++; }
     }
-    stop_timer();
+    stop_timer_CPU();
 
     printf("[CPU] Insert+Query(or Total time of generation): %0.3f ms\n", elapsed_time);
-	  printf("[CPU] False negatives: %d/%ld\n", bf_h.misses, NUMBER_OF_ELEMENTS);
+	printf("[CPU] False negatives: %d/%ld\n", bf_h.misses, NUMBER_OF_ELEMENTS);
 
     /* _____ FREE MEMORY  ___________________________________________________________________________________ */
 
-    free(byte_array_h);
-    free(strings_h);
+    // free(byte_array_h);
+    // free(strings_h);
     
+
+    /* _____ Test GPU Code  ___________________________________________________________________________________ */
+    
+    // Only meant to measure "time spent on Bloom filter operations (insertions + membership checks)", 
+    // so filter initialization is outside
+    // Initialization needs to be on GPU
+    filter_gpu filter;
+    filter.error = ERROR;
+    filter.num_elements = STRINGS_ADDED;
+    filter.num_bits = ceil((STRINGS_ADDED * log(ERROR)) / log(1 / pow(2, log(2))));
+    filter.num_hashes = round((filter.num_bits / STRINGS_ADDED) * log(2));
+    filter.misses = 0;
+
+    
+    uint8_t *byte_array_d;
+    filter_gpu* filter_d;
+    char* strings_d;
+    int* positions_d;
+    cudaMalloc((void**) &byte_array_d, filter.num_bits*sizeof(uint8_t));
+    cudaMalloc((void**) &filter_d, sizeof(filter_gpu));
+    cudaMalloc((void**) &strings_d, lenStrings);
+    cudaMalloc((void**) &positions_d, STRINGS_ADDED*sizeof(int));
+    cudaMemset(byte_array_d, 0, filter.num_bits*sizeof(uint8_t));
+    cudaMemcpy(filter_d, &filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
+    cudaMemcpy(strings_d, strings_h, lenStrings, cudaMemcpyHostToDevice);
+    cudaMemcpy(positions_d, positions_h, STRINGS_ADDED*sizeof(int), cudaMemcpyHostToDevice);
+
+
+    const unsigned long long int numBlocks = (STRINGS_ADDED + blockSize - 1) / blockSize;
+
+    start_timer();
+
+    // Insert all strings into bloom filter
+    insertionKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, positions_d, NUMBER_OF_ELEMENTS);
+
+    
+    // Check membership
+    missesKernel<<<numBlocks, blockSize>>>();
+
+
+    double gpu_elapsed_time = stop_timer();
+    double speedup = elapsed_time / gpu_elapsed_time;
+
+
+    uint8_t* byte_array_gpu = (uint8_t*)calloc(filter.num_bits, sizeof(uint8_t));
+    cudaMemcpy(byte_array_gpu, byte_array_d, filter.num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < bf_h.num_bits; i++)
+    {
+        if (byte_array_h[i] != byte_array_gpu[i])
+        {
+            printf("Element at %d is different\n", i);
+        }
+    }
+
+    free(byte_array_h);
+    free(byte_array_gpu);
+    free(strings_h);
+
+    cudaFree(byte_array_d);
+    cudaFree(filter_d);
+    cudaFree(strings_d);
+    cudaFree(positions_d);
+
+    
+    printf("[GPU] Insert+Query: %0.3f ms (%.1lfx speedup)\n", gpu_elapsed_time, speedup);
+	printf("[GPU] False negatives: %d/%ld\n", filter.misses, NUMBER_OF_ELEMENTS);
+
     return 0;
 }
+
