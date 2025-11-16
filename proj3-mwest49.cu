@@ -348,6 +348,10 @@ int generate_flattened_string(int count, int max_string_length, char **flattened
 // GPU Code
 //##############################################################################
 
+// __device__ inline int sipHashGPU(str, len, key, out, )
+// {
+
+// }
 
 
 __global__ void insertionKernel(filter_gpu* filter, 
@@ -378,23 +382,59 @@ __global__ void insertionKernel(filter_gpu* filter,
 
             // regenerate a new key based on the previous hash
             for (size_t j = 0; j < 16; j++) {
-                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
+                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8)); // Parallel Scan???????
+                // New key is based on previouis hash. So we build up consecutively. Is this associative?
             }
         }
     }
 }
 
-// __device__ inline int sipHashGPU()
-// {
-
-// }
-
-__global__ void missesKernel()
+__global__ void missesKernel(filter_gpu* filter, 
+                            uint8_t* byte_array, 
+                            char* strings,
+                            int* positions,
+                            int count)
 {
+    unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    
+    if (index < count)
+    {
+        char* str = strings + positions[index];
+        int returnVal = 1;
 
+        uint64_t hash;
+        uint8_t out[8], key[16] = {1};
+
+        // find the string length -- cannot use strlen() because that is __host__ only.
+        uint8_t len = 0;
+        while (str[len] != '\0') { len++; }
+
+        // generate and check as many hashes as required (determined by function init_filter)
+        for (uint8_t i = 0; i <  filter->num_hashes; i++) {
+            siphash(str, len, key, out, 8);             // create a new hash from the given string and key
+            memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
+            
+            /*  if byte_array is set the 1, then the string may exist in the filter (not guaranteed)
+                if byte_array is set to 0, then the string does not exist in the filter (guaranteed). */
+            if (byte_array[hash % (filter->num_bits)] == 0) 
+            {
+                returnVal = 0; 
+                break;
+            }
+
+            // regenerate a new key based on the previous hash
+            for (size_t j = 0; j < 16; j++) {
+                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
+            }
+        }
+
+        // if 0, add to structure count
+        // Private copies for sure and parallel reduction
+        if (returnVal == 0) {
+            atomicAdd((unsigned long long *) &(filter->misses), (unsigned long long) 1);
+        }
+    }
 }
-
-
 
 
 
@@ -419,7 +459,7 @@ inline double stop_timer()
 	float elapsedTime;
 	cudaEventElapsedTime(&elapsedTime, gpu_start, gpu_stop);
 	cudaEventDestroy(gpu_start);
-	cudaEventDestroy(gpu_stop);\
+	cudaEventDestroy(gpu_stop);
 
     return elapsedTime;
 }
@@ -433,7 +473,7 @@ int main(int argc, char **argv) {
 
     if (argc != 4) {
         printf("Invalid. Requires 3 arguments.\n");
-        printf("{ # of elements } { desired %% error }\n\n");
+        printf("{ # of elements } { desired %% error } { # of threads per block }\n\n");
         return -1;
     }
 
@@ -517,7 +557,7 @@ int main(int argc, char **argv) {
 
     
     // Check membership
-    missesKernel<<<numBlocks, blockSize>>>();
+    missesKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, positions_d, NUMBER_OF_ELEMENTS);
 
 
     double gpu_elapsed_time = stop_timer();
@@ -533,6 +573,8 @@ int main(int argc, char **argv) {
             printf("Element at %d is different\n", i);
         }
     }
+
+    cudaMemcpy(&filter, filter_d, sizeof(filter_gpu), cudaMemcpyDeviceToHost);
 
     free(byte_array_h);
     free(byte_array_gpu);
