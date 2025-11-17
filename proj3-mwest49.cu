@@ -357,7 +357,7 @@ int generate_flattened_string(int count, int max_string_length, char **flattened
 __global__ void insertionKernel(filter_gpu* filter, 
                                 uint8_t* byte_array, 
                                 char* strings,
-                                int* positions,
+                                uint8_t* lens,
                                 int count) 
 {
     // Threads overall index
@@ -365,7 +365,11 @@ __global__ void insertionKernel(filter_gpu* filter,
     
     if (index < count) 
     {
-        char* str = strings + positions[index];
+        char str[MAX_STRING_LENGTH + 1];
+        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
+        {
+            str[i] = strings[index + i * count];
+        }
         uint64_t hash;
         uint8_t out[8], key[16] = {1}; // Need to make sure it is NOT in global memory
 
@@ -392,14 +396,18 @@ __global__ void insertionKernel(filter_gpu* filter,
 __global__ void missesKernel(filter_gpu* filter, 
                             uint8_t* byte_array, 
                             char* strings,
-                            int* positions,
+                            uint8_t* lens,
                             int count)
 {
     unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
     if (index < count)
     {
-        char* str = strings + positions[index];
+        char str[MAX_STRING_LENGTH + 1];
+        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
+        {
+            str[i] = strings[index + i * count];
+        }
         int returnVal = 1;
 
         uint64_t hash;
@@ -526,6 +534,29 @@ int main(int argc, char **argv) {
     // Only meant to measure "time spent on Bloom filter operations (insertions + membership checks)", 
     // so filter initialization is outside
     // Initialization needs to be on GPU
+
+
+    // Convert Strings to coalesced access:
+    char* coalesced_strings = (char*)malloc(sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
+    uint8_t* len = (uint8_t*)malloc(NUMBER_OF_ELEMENTS * sizeof(uint8_t));
+    memset(len, 0, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
+    for (int i = 0; i < NUMBER_OF_ELEMENTS; i++)
+    {
+        char* str = strings_h + positions_h[i];
+        bool end = false;
+        for (int j = 0; j < MAX_STRING_LENGTH + 1; j++)
+        {
+            if (end) {
+                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = '\0';
+            } else {
+                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = str[j];
+                if (str[j] == '\0') { end = true; }
+                else { len[i]++; }
+            }
+        }
+    }
+
+    
     filter_gpu filter;
     filter.error = ERROR;
     filter.num_elements = STRINGS_ADDED;
@@ -537,15 +568,15 @@ int main(int argc, char **argv) {
     uint8_t *byte_array_d;
     filter_gpu* filter_d;
     char* strings_d;
-    int* positions_d;
+    uint8_t* len_d;
     cudaMalloc((void**) &byte_array_d, filter.num_bits*sizeof(uint8_t));
     cudaMalloc((void**) &filter_d, sizeof(filter_gpu));
-    cudaMalloc((void**) &strings_d, lenStrings);
-    cudaMalloc((void**) &positions_d, STRINGS_ADDED*sizeof(int));
+    cudaMalloc((void**) &strings_d, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
+    cudaMalloc((void**) &len_d, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
     cudaMemset(byte_array_d, 0, filter.num_bits*sizeof(uint8_t));
     cudaMemcpy(filter_d, &filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
-    cudaMemcpy(strings_d, strings_h, lenStrings, cudaMemcpyHostToDevice);
-    cudaMemcpy(positions_d, positions_h, STRINGS_ADDED*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(strings_d, coalesced_strings, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS, cudaMemcpyHostToDevice);
+    cudaMemcpy(len_d, len, NUMBER_OF_ELEMENTS * sizeof(uint8_t), cudaMemcpyHostToDevice);
 
 
     const unsigned long long int numBlocks = (STRINGS_ADDED + blockSize - 1) / blockSize;
@@ -553,11 +584,11 @@ int main(int argc, char **argv) {
     start_timer();
 
     // Insert all strings into bloom filter
-    insertionKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, positions_d, NUMBER_OF_ELEMENTS);
+    insertionKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
     
     // Check membership
-    missesKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, positions_d, NUMBER_OF_ELEMENTS);
+    missesKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
 
     double gpu_elapsed_time = stop_timer();
@@ -579,11 +610,12 @@ int main(int argc, char **argv) {
     free(byte_array_h);
     free(byte_array_gpu);
     free(strings_h);
+    free(len);
 
     cudaFree(byte_array_d);
     cudaFree(filter_d);
     cudaFree(strings_d);
-    cudaFree(positions_d);
+    cudaFree(len_d);
 
     
     printf("[GPU] Insert+Query: %0.3f ms (%.1lfx speedup)\n", gpu_elapsed_time, speedup);
