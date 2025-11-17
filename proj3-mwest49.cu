@@ -348,12 +348,6 @@ int generate_flattened_string(int count, int max_string_length, char **flattened
 // GPU Code
 //##############################################################################
 
-// __device__ inline int sipHashGPU(str, len, key, out, )
-// {
-
-// }
-
-
 __global__ void insertionKernel(filter_gpu* filter, 
                                 uint8_t* byte_array, 
                                 char* strings,
@@ -368,16 +362,14 @@ __global__ void insertionKernel(filter_gpu* filter,
     if (index < count) 
     {
         char* str = sharedStr + threadIdx.x*(MAX_STRING_LENGTH + 1);
-        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
+        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++)
         {
             str[i] = strings[index + i * count];
         }
         uint64_t hash;
         uint8_t out[8], key[16] = {1}; // Need to make sure it is NOT in global memory
 
-        // find the string length -- cannot use strlen() because that is __host__ only.
-        uint8_t len = 0;
-        while (str[len] != '\0') { len++; }
+        uint8_t len = lens[index];
 
         // generate and add as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i < filter->num_hashes; i++) {
@@ -394,6 +386,7 @@ __global__ void insertionKernel(filter_gpu* filter,
         }
     }
 }
+
 
 __global__ void missesKernel(filter_gpu* filter, 
                             uint8_t* byte_array, 
@@ -417,9 +410,7 @@ __global__ void missesKernel(filter_gpu* filter,
         uint64_t hash;
         uint8_t out[8], key[16] = {1};
 
-        // find the string length -- cannot use strlen() because that is __host__ only.
-        uint8_t len = 0;
-        while (str[len] != '\0') { len++; }
+        uint8_t len = lens[index];
 
         // generate and check as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i <  filter->num_hashes; i++) {
@@ -446,6 +437,53 @@ __global__ void missesKernel(filter_gpu* filter,
             atomicAdd((unsigned long long *) &(filter->misses), (unsigned long long) 1);
         }
     }
+}
+
+
+
+void initialize_filter(uint8_t **byte_array_d, filter_gpu **filter_d, char **strings_d, uint8_t **len_d)
+{
+    // Convert Strings to coalesced access:
+    char* coalesced_strings = (char*)malloc(sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
+    uint8_t* len = (uint8_t*)malloc(NUMBER_OF_ELEMENTS * sizeof(uint8_t));
+    memset(len, 0, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
+    for (int i = 0; i < NUMBER_OF_ELEMENTS; i++)
+    {
+        char* str = strings_h + positions_h[i];
+        bool end = false;
+        for (int j = 0; j < MAX_STRING_LENGTH + 1; j++)
+        {
+            if (end) {
+                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = '\0';
+            } else {
+                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = str[j];
+                if (str[j] == '\0') { end = true; }
+                else { len[i]++; }
+            }
+        }
+    }
+
+
+    filter_gpu* filter;
+    filter = (filter_gpu*)malloc(sizeof(filter_gpu));
+    filter->error = ERROR;
+    filter->num_elements = STRINGS_ADDED;
+    filter->num_bits = ceil((STRINGS_ADDED * log(ERROR)) / log(1 / pow(2, log(2))));
+    filter->num_hashes = round((filter->num_bits / STRINGS_ADDED) * log(2));
+    filter->misses = 0;
+
+    cudaMalloc((void**) byte_array_d, filter->num_bits*sizeof(uint8_t));
+    cudaMalloc((void**) filter_d, sizeof(filter_gpu));
+    cudaMalloc((void**) strings_d, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
+    cudaMalloc((void**) len_d, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
+    cudaMemset(*byte_array_d, 0, filter->num_bits*sizeof(uint8_t));
+    cudaMemcpy(*filter_d, filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
+    cudaMemcpy(*strings_d, coalesced_strings, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS, cudaMemcpyHostToDevice);
+    cudaMemcpy(*len_d, len, NUMBER_OF_ELEMENTS * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    free(filter);
+    free(coalesced_strings);
+    free(len);
 }
 
 
@@ -527,80 +565,47 @@ int main(int argc, char **argv) {
     printf("[CPU] Insert+Query(or Total time of generation): %0.3f ms\n", elapsed_time);
 	printf("[CPU] False negatives: %d/%ld\n", bf_h.misses, NUMBER_OF_ELEMENTS);
 
-    /* _____ FREE MEMORY  ___________________________________________________________________________________ */
-
-    // free(byte_array_h);
-    // free(strings_h);
-    
-
     /* _____ Test GPU Code  ___________________________________________________________________________________ */
     
     // Only meant to measure "time spent on Bloom filter operations (insertions + membership checks)", 
     // so filter initialization is outside
-    // Initialization needs to be on GPU
-
-
-    // Convert Strings to coalesced access:
-    char* coalesced_strings = (char*)malloc(sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
-    uint8_t* len = (uint8_t*)malloc(NUMBER_OF_ELEMENTS * sizeof(uint8_t));
-    memset(len, 0, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
-    for (int i = 0; i < NUMBER_OF_ELEMENTS; i++)
-    {
-        char* str = strings_h + positions_h[i];
-        bool end = false;
-        for (int j = 0; j < MAX_STRING_LENGTH + 1; j++)
-        {
-            if (end) {
-                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = '\0';
-            } else {
-                coalesced_strings[i + j*NUMBER_OF_ELEMENTS] = str[j];
-                if (str[j] == '\0') { end = true; }
-                else { len[i]++; }
-            }
-        }
-    }
-
-    
-    filter_gpu filter;
-    filter.error = ERROR;
-    filter.num_elements = STRINGS_ADDED;
-    filter.num_bits = ceil((STRINGS_ADDED * log(ERROR)) / log(1 / pow(2, log(2))));
-    filter.num_hashes = round((filter.num_bits / STRINGS_ADDED) * log(2));
-    filter.misses = 0;
-
     
     uint8_t *byte_array_d;
     filter_gpu* filter_d;
     char* strings_d;
     uint8_t* len_d;
-    cudaMalloc((void**) &byte_array_d, filter.num_bits*sizeof(uint8_t));
-    cudaMalloc((void**) &filter_d, sizeof(filter_gpu));
-    cudaMalloc((void**) &strings_d, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
-    cudaMalloc((void**) &len_d, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
-    cudaMemset(byte_array_d, 0, filter.num_bits*sizeof(uint8_t));
-    cudaMemcpy(filter_d, &filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
-    cudaMemcpy(strings_d, coalesced_strings, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS, cudaMemcpyHostToDevice);
-    cudaMemcpy(len_d, len, NUMBER_OF_ELEMENTS * sizeof(uint8_t), cudaMemcpyHostToDevice);
-
+    initialize_filter(&byte_array_d, &filter_d, &strings_d, &len_d);
 
     const unsigned long long int numBlocks = (STRINGS_ADDED + blockSize - 1) / blockSize;
-    const size_t sharedMemory = numBlocks*(MAX_STRING_LENGTH + 1)*sizeof(char);
-    start_timer();
+    const size_t sharedMemory = blockSize*(MAX_STRING_LENGTH + 1)*sizeof(char);
 
+
+    // Start Timer
+    start_timer();
+    
     // Insert all strings into bloom filter
     insertionKernel<<<numBlocks, blockSize, sharedMemory>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
-
-    
     // Check membership
     missesKernel<<<numBlocks, blockSize, sharedMemory>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
-
-
+    
     double gpu_elapsed_time = stop_timer();
+    // Stop Timer
+
+
     double speedup = elapsed_time / gpu_elapsed_time;
 
 
-    uint8_t* byte_array_gpu = (uint8_t*)calloc(filter.num_bits, sizeof(uint8_t));
-    cudaMemcpy(byte_array_gpu, byte_array_d, filter.num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+    filter_gpu* filter;
+    filter = (filter_gpu*)malloc(sizeof(filter_gpu));
+    filter->error = ERROR;
+    filter->num_elements = STRINGS_ADDED;
+    filter->num_bits = ceil((STRINGS_ADDED * log(ERROR)) / log(1 / pow(2, log(2))));
+    filter->num_hashes = round((filter->num_bits / STRINGS_ADDED) * log(2));
+    filter->misses = 0;
+
+    uint8_t* byte_array_gpu = (uint8_t*)calloc(filter->num_bits, sizeof(uint8_t));
+    cudaMemcpy(byte_array_gpu, byte_array_d, filter->num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
     for (int i = 0; i < bf_h.num_bits; i++)
     {
         if (byte_array_h[i] != byte_array_gpu[i])
@@ -609,22 +614,25 @@ int main(int argc, char **argv) {
         }
     }
 
-    cudaMemcpy(&filter, filter_d, sizeof(filter_gpu), cudaMemcpyDeviceToHost);
+    // filter_gpu* filter;
+    filter = (filter_gpu*)malloc(sizeof(filter_gpu));
+    cudaMemcpy(filter, filter_d, sizeof(filter_gpu), cudaMemcpyDeviceToHost);
+
+    printf("[GPU] Insert+Query: %0.3f ms (%.1lfx speedup)\n", gpu_elapsed_time, speedup);
+	printf("[GPU] False negatives: %d/%ld\n", filter->misses, NUMBER_OF_ELEMENTS);
+
+
+    /* _____ FREE MEMORY  ___________________________________________________________________________________ */
 
     free(byte_array_h);
     free(byte_array_gpu);
+
     free(strings_h);
-    free(len);
 
     cudaFree(byte_array_d);
     cudaFree(filter_d);
     cudaFree(strings_d);
     cudaFree(len_d);
 
-    
-    printf("[GPU] Insert+Query: %0.3f ms (%.1lfx speedup)\n", gpu_elapsed_time, speedup);
-	printf("[GPU] False negatives: %d/%ld\n", filter.misses, NUMBER_OF_ELEMENTS);
-
     return 0;
 }
-
