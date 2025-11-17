@@ -203,6 +203,12 @@ typedef struct bloom_filter_gpu{
     int misses;                     // number of misses (default: 0)
 } filter_gpu;
 
+// typedef union hashData {
+//     uint8_t out[8];
+//     uint64_t hash;
+// } hashData;
+
+
 double ERROR;                                   // false positivity rate of the filter (determined by user)
 uint64_t NUMBER_OF_ELEMENTS, STRINGS_ADDED;     // number of strings total and number of strings added to the filter
 int blockSize;
@@ -366,16 +372,25 @@ __global__ void insertionKernel(filter_gpu* filter,
         {
             str[i] = strings[index + i * count];
         }
+        // hashData hash;
         uint64_t hash;
-        uint8_t out[8], key[16] = {1}; // Need to make sure it is NOT in global memory
+        uint8_t out[8];
+        uint8_t key[16] = {1}; // Need to make sure it is NOT in global memory
 
         uint8_t len = lens[index];
 
         // generate and add as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i < filter->num_hashes; i++) {
             siphash(str, len, key, out, 8);             // create a new hash from the given string and key
-            
-            memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
+            hash = ((uint64_t)out[7] << (7*8)) | 
+                   ((uint64_t)out[6] << (6*8)) | 
+                   ((uint64_t)out[5] << (5*8)) | 
+                   ((uint64_t)out[4] << (4*8)) | 
+                   ((uint64_t)out[3] << (3*8)) | 
+                   ((uint64_t)out[2] << (2*8)) | 
+                   ((uint64_t)out[1] << (1*8)) | 
+                   (uint64_t)out[0];
+                   
             byte_array[hash % filter->num_bits] = 1;     // set the index byte to 1
 
             // regenerate a new key based on the previous hash
@@ -401,21 +416,30 @@ __global__ void missesKernel(filter_gpu* filter,
     if (index < count)
     {
         char* str = sharedStr + threadIdx.x * (MAX_STRING_LENGTH + 1);
-        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
+        for (int i = 0; i < MAX_STRING_LENGTH + 1; i++)
         {
             str[i] = strings[index + i * count];
         }
         int returnVal = 1;
 
         uint64_t hash;
-        uint8_t out[8], key[16] = {1};
+        uint8_t out[8]; 
+        uint8_t key[16] = {1};
+        // hashData hash;
 
         uint8_t len = lens[index];
 
         // generate and check as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i <  filter->num_hashes; i++) {
             siphash(str, len, key, out, 8);             // create a new hash from the given string and key
-            memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
+            hash = ((uint64_t)out[7] << (7*8)) | 
+                   ((uint64_t)out[6] << (6*8)) | 
+                   ((uint64_t)out[5] << (5*8)) | 
+                   ((uint64_t)out[4] << (4*8)) | 
+                   ((uint64_t)out[3] << (3*8)) | 
+                   ((uint64_t)out[2] << (2*8)) | 
+                   ((uint64_t)out[1] << (1*8)) | 
+                   (uint64_t)out[0];
             
             /*  if byte_array is set the 1, then the string may exist in the filter (not guaranteed)
                 if byte_array is set to 0, then the string does not exist in the filter (guaranteed). */
@@ -432,9 +456,10 @@ __global__ void missesKernel(filter_gpu* filter,
         }
 
         // if 0, add to structure count
-        // Private copies for sure and parallel reduction
         if (returnVal == 0) {
-            atomicAdd((unsigned long long *) &(filter->misses), (unsigned long long) 1);
+            atomicAdd((unsigned long long *) &(filter->misses), (unsigned long long) 1); 
+            // Since if our structure is implemented correctly, we will never have misses with the same dataset, the atomic operation is fine
+            // Having private copies would most likely cost us far more in occupancy and the reduction phase
         }
     }
 }
