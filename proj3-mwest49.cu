@@ -355,14 +355,24 @@ int generate_flattened_string(int count, int max_string_length, char **flattened
 
 
 __global__ void insertionKernel(filter_gpu* filter, 
-                                uint8_t* byte_array, 
+                                uint32_t* byte_array, 
                                 char* strings,
                                 uint8_t* lens,
                                 int count) 
 {
     // Threads overall index
-    unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    unsigned int index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
+    extern __shared__ uint32_t local_byte_array[]; // This is seriously reducing occupancy
+    const unsigned int numWords = (filter->num_bits + 31) / 32;
+
+    for (int i = threadIdx.x; i < numWords; i += blockDim.x)
+    {
+        local_byte_array[i] = 0;
+    }
+
+    __syncthreads();
+
     if (index < count) 
     {
         char str[MAX_STRING_LENGTH + 1];
@@ -370,19 +380,20 @@ __global__ void insertionKernel(filter_gpu* filter,
         {
             str[i] = strings[index + i * count];
         }
-        uint64_t hash;
+        uint64_t hash;// = threadIdx.x;
         uint8_t out[8], key[16] = {1}; // Need to make sure it is NOT in global memory
 
-        // find the string length -- cannot use strlen() because that is __host__ only.
-        uint8_t len = 0;
-        while (str[len] != '\0') { len++; }
 
         // generate and add as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i < filter->num_hashes; i++) {
-            siphash(str, len, key, out, 8);             // create a new hash from the given string and key
-            
+            siphash(str, lens[index], key, out, 8);             // create a new hash from the given string and key
             memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
-            byte_array[hash % filter->num_bits] = 1;     // set the index byte to 1
+            
+            uint64_t bitIndex = hash % filter->num_bits;
+            uint32_t wordIdx = bitIndex / 32;
+            uint32_t bitInWord = bitIndex % 32;
+            uint32_t mask = (1U << bitInWord);
+            atomicOr(&local_byte_array[wordIdx], mask);     // set the index byte to 1
 
             // regenerate a new key based on the previous hash
             for (size_t j = 0; j < 16; j++) {
@@ -391,10 +402,17 @@ __global__ void insertionKernel(filter_gpu* filter,
             }
         }
     }
+
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < numWords; i += blockDim.x) // Instead of copies in local, have multiple copies in global. Then combine. To increase occupancy
+    {
+        atomicOr(&byte_array[i], local_byte_array[i]);
+    }
 }
 
 __global__ void missesKernel(filter_gpu* filter, 
-                            uint8_t* byte_array, 
+                            uint32_t* byte_array, 
                             char* strings,
                             uint8_t* lens,
                             int count)
@@ -413,13 +431,10 @@ __global__ void missesKernel(filter_gpu* filter,
         uint64_t hash;
         uint8_t out[8], key[16] = {1};
 
-        // find the string length -- cannot use strlen() because that is __host__ only.
-        uint8_t len = 0;
-        while (str[len] != '\0') { len++; }
 
         // generate and check as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i <  filter->num_hashes; i++) {
-            siphash(str, len, key, out, 8);             // create a new hash from the given string and key
+            siphash(str, lens[index], key, out, 8);             // create a new hash from the given string and key
             memcpy(&hash, out, sizeof(uint64_t));       // copy the output to the hash variable
             
             /*  if byte_array is set the 1, then the string may exist in the filter (not guaranteed)
@@ -565,15 +580,15 @@ int main(int argc, char **argv) {
     filter.misses = 0;
 
     
-    uint8_t *byte_array_d;
+    uint32_t *byte_array_d;
     filter_gpu* filter_d;
     char* strings_d;
     uint8_t* len_d;
-    cudaMalloc((void**) &byte_array_d, filter.num_bits*sizeof(uint8_t));
+    cudaMalloc((void**) &byte_array_d, filter.num_bits*sizeof(uint32_t));
     cudaMalloc((void**) &filter_d, sizeof(filter_gpu));
     cudaMalloc((void**) &strings_d, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
     cudaMalloc((void**) &len_d, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
-    cudaMemset(byte_array_d, 0, filter.num_bits*sizeof(uint8_t));
+    cudaMemset(byte_array_d, 0, filter.num_bits*sizeof(uint32_t));
     cudaMemcpy(filter_d, &filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
     cudaMemcpy(strings_d, coalesced_strings, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS, cudaMemcpyHostToDevice);
     cudaMemcpy(len_d, len, NUMBER_OF_ELEMENTS * sizeof(uint8_t), cudaMemcpyHostToDevice);
@@ -581,25 +596,32 @@ int main(int argc, char **argv) {
 
     const unsigned long long int numBlocks = (STRINGS_ADDED + blockSize - 1) / blockSize;
 
+
+    const size_t sizeByteArray = ((filter.num_bits + 31) / 32) * sizeof(uint32_t);
     start_timer();
 
     // Insert all strings into bloom filter
-    insertionKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
+    insertionKernel<<<numBlocks, blockSize, sizeByteArray>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
     
     // Check membership
-    missesKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
+    // missesKernel<<<numBlocks, blockSize, sizeByteArray>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
 
     double gpu_elapsed_time = stop_timer();
     double speedup = elapsed_time / gpu_elapsed_time;
 
 
-    uint8_t* byte_array_gpu = (uint8_t*)calloc(filter.num_bits, sizeof(uint8_t));
-    cudaMemcpy(byte_array_gpu, byte_array_d, filter.num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    uint32_t* byte_array_gpu = (uint32_t*)malloc(sizeByteArray);
+    cudaMemcpy(byte_array_gpu, byte_array_d, sizeByteArray, cudaMemcpyDeviceToHost);
     for (int i = 0; i < bf_h.num_bits; i++)
     {
-        if (byte_array_h[i] != byte_array_gpu[i])
+        uint32_t wordIdx = i / 32;
+        uint32_t bitInWord = i % 32;
+        uint32_t mask = (1U << bitInWord);
+
+        int val = (byte_array_gpu[wordIdx] & mask) != 0;
+        if (byte_array_h[i] != val)
         {
             printf("Element at %d is different\n", i);
         }
