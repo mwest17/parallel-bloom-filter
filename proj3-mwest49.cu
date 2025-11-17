@@ -360,12 +360,14 @@ __global__ void insertionKernel(filter_gpu* filter,
                                 uint8_t* lens,
                                 int count) 
 {
+    extern __shared__ char sharedStr[];
+
     // Threads overall index
     unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
     if (index < count) 
     {
-        char str[MAX_STRING_LENGTH + 1];
+        char* str = sharedStr + threadIdx.x*(MAX_STRING_LENGTH + 1);
         for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
         {
             str[i] = strings[index + i * count];
@@ -399,11 +401,13 @@ __global__ void missesKernel(filter_gpu* filter,
                             uint8_t* lens,
                             int count)
 {
+    extern __shared__ char sharedStr[];
+
     unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
     if (index < count)
     {
-        char str[MAX_STRING_LENGTH + 1];
+        char* str = sharedStr + threadIdx.x * (MAX_STRING_LENGTH + 1);
         for (int i = 0; i < MAX_STRING_LENGTH + 1; i++) // Control Divergence if using length to stop this loop (loop can be unrolled if using define)
         {
             str[i] = strings[index + i * count];
@@ -580,15 +584,15 @@ int main(int argc, char **argv) {
 
 
     const unsigned long long int numBlocks = (STRINGS_ADDED + blockSize - 1) / blockSize;
-
+    const size_t sharedMemory = numBlocks*(MAX_STRING_LENGTH + 1)*sizeof(char);
     start_timer();
 
     // Insert all strings into bloom filter
-    insertionKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
+    insertionKernel<<<numBlocks, blockSize, sharedMemory>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
     
     // Check membership
-    missesKernel<<<numBlocks, blockSize>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
+    missesKernel<<<numBlocks, blockSize, sharedMemory>>>(filter_d, byte_array_d, strings_d, len_d, NUMBER_OF_ELEMENTS);
 
 
     double gpu_elapsed_time = stop_timer();
