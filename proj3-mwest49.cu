@@ -388,10 +388,15 @@ __global__ void insertionKernel(filter_gpu* filter,
                    ((uint64_t)out[1] << (1*8)) | 
                    (uint64_t)out[0];
                    
-            byte_array[hash % filter->num_bits] = 1;     // set the index byte to 1
+            // Hash determines what 'bit' in array corresponds to this input
+            // Setting to 1 means we are inserting
+            // Note: These global memory accesses are not coallesced. 
+            // Conflicts are not an issue though, by nature of the data structure
+            byte_array[hash % filter->num_bits] = 1;
 
-            // regenerate a new key based on the previous hash
-            for (uint8_t j = 0; j < 16; j++) {
+            for (uint8_t j = 0; j < 16; j++) 
+            {
+                // Generate new key
                 ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
             }
         }
@@ -427,9 +432,11 @@ __global__ void missesKernel(filter_gpu* filter,
         uint8_t key[16] = {1};
         uint8_t len = lens[index];
 
-        // generate and check as many hashes as required (determined by function init_filter)
+        // hash as many times as needed by data structure
         for (uint8_t i = 0; i <  filter->num_hashes; i++) {
-            siphash(str, len, key, out, 8);             // create a new hash from the given string and key
+            siphash(str, len, key, out, 8);
+            // siphash function call returns array of 8, 8-bit values. Shifting and OR-ing to store in 64-bit register
+            // The values will overflow if they are not cast to 64-bit
             hash = ((uint64_t)out[7] << (7*8)) | 
                    ((uint64_t)out[6] << (6*8)) | 
                    ((uint64_t)out[5] << (5*8)) | 
@@ -439,16 +446,16 @@ __global__ void missesKernel(filter_gpu* filter,
                    ((uint64_t)out[1] << (1*8)) | 
                    (uint64_t)out[0];
             
-            /*  if byte_array is set the 1, then the string may exist in the filter (not guaranteed)
-                if byte_array is set to 0, then the string does not exist in the filter (guaranteed). */
+            // 1 - May be in, 0 - Definitely is not in
             if (byte_array[hash % (filter->num_bits)] == 0) 
             {
                 returnVal = 0; 
                 break;
             }
 
-            // regenerate a new key based on the previous hash
-            for (uint8_t j = 0; j < 16; j++) {
+            for (uint8_t j = 0; j < 16; j++) 
+            {
+                // Generate new key
                 ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
             }
         }
@@ -457,7 +464,7 @@ __global__ void missesKernel(filter_gpu* filter,
         if (returnVal == 0) {
             atomicAdd((uint128_t*) &(filter->misses), (uint128_t) 1); 
             // Since if our structure is implemented correctly, we will never have misses with the same dataset, the atomic operation is fine
-            // Having private copies would most likely cost us far more in occupancy and the reduction phase
+            // Having private copies would most likely cost us far more in occupancy and in the reduction phase
         }
     }
 }
