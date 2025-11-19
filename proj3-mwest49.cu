@@ -203,11 +203,6 @@ typedef struct bloom_filter_gpu{
     int misses;                     // number of misses (default: 0)
 } filter_gpu;
 
-// typedef union hashData {
-//     uint8_t out[8];
-//     uint64_t hash;
-// } hashData;
-
 
 double ERROR;                                   // false positivity rate of the filter (determined by user)
 uint64_t NUMBER_OF_ELEMENTS, STRINGS_ADDED;     // number of strings total and number of strings added to the filter
@@ -363,21 +358,23 @@ __global__ void insertionKernel(filter_gpu* filter,
     extern __shared__ char sharedStr[];
 
     // Threads overall index
-    unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    const size_t index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
     if (index < count) 
     {
+        // Save string from global memory to shared memory
         char* str = sharedStr + threadIdx.x*(MAX_STRING_LENGTH + 1);
         for (int i = 0; i < MAX_STRING_LENGTH + 1; i++)
         {
             str[i] = strings[index + i * count];
+            // In global memory, all strings's first character are stored sequentially, then all second characters, etc
+            // Any extra characters are \0
         }
-        // hashData hash;
+        
         uint64_t hash;
         uint8_t out[8];
-        uint8_t key[16] = {1}; // Need to make sure it is NOT in global memory
-
-        uint8_t len = lens[index];
+        uint8_t key[16] = {1};
+        uint8_t len = lens[index]; // Save len of string to register
 
         // generate and add as many hashes as required (determined by function init_filter)
         for (uint8_t i = 0; i < filter->num_hashes; i++) {
@@ -394,9 +391,8 @@ __global__ void insertionKernel(filter_gpu* filter,
             byte_array[hash % filter->num_bits] = 1;     // set the index byte to 1
 
             // regenerate a new key based on the previous hash
-            for (size_t j = 0; j < 16; j++) {
-                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8)); // Parallel Scan???????
-                // New key is based on previouis hash. So we build up consecutively. Is this associative?
+            for (uint8_t j = 0; j < 16; j++) {
+                ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
             }
         }
     }
@@ -411,22 +407,24 @@ __global__ void missesKernel(filter_gpu* filter,
 {
     extern __shared__ char sharedStr[];
 
-    unsigned long long int index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    // Threads overall index
+    const size_t index = (blockDim.x * blockIdx.x) + threadIdx.x;
     
     if (index < count)
-    {
+    {   
+        // Save string from global memory to shared memory
         char* str = sharedStr + threadIdx.x * (MAX_STRING_LENGTH + 1);
         for (int i = 0; i < MAX_STRING_LENGTH + 1; i++)
         {
             str[i] = strings[index + i * count];
+            // In global memory, all strings's first character are stored sequentially, then all second characters, etc
+            // Any extra characters are \0
         }
-        int returnVal = 1;
+        uint8_t returnVal = 1;
 
         uint64_t hash;
         uint8_t out[8]; 
         uint8_t key[16] = {1};
-        // hashData hash;
-
         uint8_t len = lens[index];
 
         // generate and check as many hashes as required (determined by function init_filter)
@@ -450,25 +448,36 @@ __global__ void missesKernel(filter_gpu* filter,
             }
 
             // regenerate a new key based on the previous hash
-            for (size_t j = 0; j < 16; j++) {
+            for (uint8_t j = 0; j < 16; j++) {
                 ((uint8_t*)key)[j] ^= (uint8_t)(hash >> (j % 8));
             }
         }
 
         // if 0, add to structure count
         if (returnVal == 0) {
-            atomicAdd((unsigned long long *) &(filter->misses), (unsigned long long) 1); 
+            atomicAdd((uint128_t*) &(filter->misses), (uint128_t) 1); 
             // Since if our structure is implemented correctly, we will never have misses with the same dataset, the atomic operation is fine
             // Having private copies would most likely cost us far more in occupancy and the reduction phase
         }
     }
 }
 
-
+__global__ void initializeByteArray(uint8_t *byte_array_d, uint8_t numBits)
+{
+    // Threads overall index
+    const size_t index = (blockDim.x * blockIdx.x) + threadIdx.x;
+    
+    if (index < numBits)
+    {
+        byte_array_d[index] = 0;   
+    }
+}
 
 void initialize_filter(uint8_t **byte_array_d, filter_gpu **filter_d, char **strings_d, uint8_t **len_d)
 {
     // Convert Strings to coalesced access:
+    // In global memory, all strings's first character are stored sequentially, then all second characters, etc
+    // Any extra characters are \0
     char* coalesced_strings = (char*)malloc(sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
     uint8_t* len = (uint8_t*)malloc(NUMBER_OF_ELEMENTS * sizeof(uint8_t));
     memset(len, 0, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
@@ -501,10 +510,13 @@ void initialize_filter(uint8_t **byte_array_d, filter_gpu **filter_d, char **str
     cudaMalloc((void**) filter_d, sizeof(filter_gpu));
     cudaMalloc((void**) strings_d, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS);
     cudaMalloc((void**) len_d, NUMBER_OF_ELEMENTS * sizeof(uint8_t));
-    cudaMemset(*byte_array_d, 0, filter->num_bits*sizeof(uint8_t));
     cudaMemcpy(*filter_d, filter, sizeof(filter_gpu), cudaMemcpyHostToDevice);
     cudaMemcpy(*strings_d, coalesced_strings, sizeof(char) * (MAX_STRING_LENGTH + 1) * NUMBER_OF_ELEMENTS, cudaMemcpyHostToDevice);
     cudaMemcpy(*len_d, len, NUMBER_OF_ELEMENTS * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    const int blockSize = 128;
+    const size_t numBlocks = (filter->num_bits + blockSize - 1) / blockSize;
+    initializeByteArray<<<numBlocks, blockSize>>>(*byte_array_d, filter->num_bits);
 
     free(filter);
     free(coalesced_strings);
@@ -592,8 +604,7 @@ int main(int argc, char **argv) {
 
     /* _____ Test GPU Code  ___________________________________________________________________________________ */
     
-    // Only meant to measure "time spent on Bloom filter operations (insertions + membership checks)", 
-    // so filter initialization is outside
+    // Meant to measure "time spent on Bloom filter operations (insertions + membership checks)", so filter initialization is outside
     
     uint8_t *byte_array_d;
     filter_gpu* filter_d;
@@ -620,17 +631,9 @@ int main(int argc, char **argv) {
     double speedup = elapsed_time / gpu_elapsed_time;
 
 
-
-    filter_gpu* filter;
-    filter = (filter_gpu*)malloc(sizeof(filter_gpu));
-    filter->error = ERROR;
-    filter->num_elements = STRINGS_ADDED;
-    filter->num_bits = ceil((STRINGS_ADDED * log(ERROR)) / log(1 / pow(2, log(2))));
-    filter->num_hashes = round((filter->num_bits / STRINGS_ADDED) * log(2));
-    filter->misses = 0;
-
-    uint8_t* byte_array_gpu = (uint8_t*)calloc(filter->num_bits, sizeof(uint8_t));
-    cudaMemcpy(byte_array_gpu, byte_array_d, filter->num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    // Ensure byte arrays match
+    uint8_t* byte_array_gpu = (uint8_t*)calloc(bf_h.num_bits, sizeof(uint8_t));
+    cudaMemcpy(byte_array_gpu, byte_array_d, bf_h.num_bits*sizeof(uint8_t), cudaMemcpyDeviceToHost);
     for (int i = 0; i < bf_h.num_bits; i++)
     {
         if (byte_array_h[i] != byte_array_gpu[i])
@@ -639,7 +642,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    // filter_gpu* filter;
+    // Copy bloom filter off of gpu
+    filter_gpu* filter;
     filter = (filter_gpu*)malloc(sizeof(filter_gpu));
     cudaMemcpy(filter, filter_d, sizeof(filter_gpu), cudaMemcpyDeviceToHost);
 
@@ -651,7 +655,7 @@ int main(int argc, char **argv) {
 
     free(byte_array_h);
     free(byte_array_gpu);
-
+    free(filter);
     free(strings_h);
 
     cudaFree(byte_array_d);
