@@ -1,5 +1,2 @@
-\section{Conclusion}
-\hspace{\parindent}The next steps to further optimize the kernel would be to finish the improved parallel reduction and the intra-block distance balancing. They will likely only improve the speed by a small amount though. 
-
-% Prob could do loop unrolling, finish the parallel reduction, finish the intra-block balancing, tweak the model some.
-%  
+\section{Results}
+\hspace{\parindent}As Table 1 shows, the optimized GPU implementation provides a staggering speedup compared to the CPU implementation. It also seems to show that for input sizes too small, the overhead of using the GPU reduces the amount of performance gained by a lot, as shown that n=10k resulted in under half the amount of speedup compared to n=100k. Table 2 shows that all block sizes except the largest are roughly equivalent.

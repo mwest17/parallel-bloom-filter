@@ -1,6 +1,4 @@
 	%\tableofcontents
 	\section{Introduction}
 	%\cite{Bowker1985}
-	\hspace{\parindent}A bloom filter is a data structure that utilizes hashing and a bit array to determine what elements have definitely not been inserted into it. Because the inclusion in the set is only represented as a bit array, the space to represent a set is greatly reduced.
-	
-	This makes it great for large datasets. However, for n elements and k hashes, it will take O(nk) to insert or check inclusion. This can be mitigated by parallelizing the insertion and checking steps.%	
+	\hspace{\parindent}A Bloom filter is a data structure that utilizes hashing and a bit array to determine what elements have definitely not been inserted into it. Because the inclusion in the set is only represented as a bit array, the space to represent a set is greatly reduced. The time it takes to insert and check large datasets can be mitigated by parallelizing the insertion and checking steps.%	

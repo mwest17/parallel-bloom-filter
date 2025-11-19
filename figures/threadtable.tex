@@ -1,0 +1,21 @@
+\begin{table}[H]
+	\centering
+	\caption{\small{Time (in millisecond) GPU implementation running on various block sizes (n=100k, 0.1)}}
+	\vspace{0.2cm}
+	\begin{tabularx}{0.27\textwidth} { 
+			>{\centering\arraybackslash}m{2cm} 
+			>{\centering\arraybackslash}m{2cm} }
+		\hline
+		
+		Block Size & GPU\\
+		\hline
+		32    &  0.198\\
+		64    &  0.197\\
+		128  & 0.196\\
+		256    &  0.198\\
+		512    & 0.208\\
+		1024  & 0.230\\
+		\hline
+	\end{tabularx}
+	\label{table:threads}
+\end{table}
