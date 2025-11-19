@@ -1,0 +1,6 @@
+\section{Optimization}
+\subsection{String Access Coalescing}
+\hspace{\parindent}The main optimization implemented in this project was storing the input strings in such a way that they could be accessed in a coalesced manner. One of the most frequent actions done in the kernel is to read the strings. They are read from global memory on each hash generation. 
+
+In the optimized kernel, the strings were stored in an array where all the first characters of the strings were stored, then all the second characters were stored, and so on. This meant that when each thread iterated through its strings, they would all access elements adjacent to the neighboring threads. These strings were then stored as normal into shared memory for faster access. This optimization resulted in approximately a 2.5x speed increase.
+ 

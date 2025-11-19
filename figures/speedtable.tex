@@ -1,0 +1,24 @@
+\begin{table}[H]
+	\centering
+	\caption{\small{Time (in millisecond) of each CPU, Naive, and Optimized implementation}}
+	\vspace{0.2cm}
+	\begin{tabularx}{0.7\textwidth} { 
+			>{\centering\arraybackslash}m{2cm} 
+			>{\centering\arraybackslash}m{2cm} 
+			>{\centering\arraybackslash}m{2cm}
+			>{\centering\arraybackslash}m{2cm}  
+			>{\centering\arraybackslash}m{2cm} }
+		\hline
+		
+		\# Strings, False Pos Rate & CPU & Naive & Optimized & Speedup\\
+		\hline
+		10k, 0.1    & 15.093  & 0.103 & 0.046 & 326.2x\\
+		100k, 0.1  & 154.21 & 0.516 & 0.198 & 778.1x\\
+		1m, 0.1    &  1560.5 & 5.066 & 2.074 & 752.5x\\
+		10k, 0.8    & 1.0400 & 0.043 & 0.015 & 67.6x\\
+		100k, 0.8  & 10.388  & 0.121 & 0.030 & 342.4x\\
+		1m, 0.8    &  103.52 & 1.004 & 0.237 & 437.4x\\
+		\hline
+	\end{tabularx}
+	\label{table:speeds}
+\end{table}

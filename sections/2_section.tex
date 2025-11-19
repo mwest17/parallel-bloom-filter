@@ -1,0 +1,8 @@
+\section{Implementation}
+\hspace{\parindent} This project implements 3 kernel functions to operate on the bloom filter data structure. The first initializes the bit array to all zeroes. All zeroes are equivalent to nothing in the filter. The kernel has each thread to assign a single element to zero. 
+
+The insertion kernel takes all elements in an array, assigns a single thread to each, and then inserts 1's at the indices corresponding to the hashes of the element. This ensures that if an element has a hash that is missing a 1, it is definitely not in the filter.
+
+The check kernel behaves similarly. It also hashes the string multiple times. It uses these hashes to see if all of the corresponding hashes are set. If it finds one that isn't, then it adds to the missed counter. 
+
+The hashing function used was SipHash. The implementation provided by Aumasson and Bernstein worked fine when compiled for GPU without any changes. The only tweak made was to make it inline to eliminate any function call overhead.
